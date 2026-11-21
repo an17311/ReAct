@@ -167,7 +167,10 @@ public abstract class ReActBaseAgent extends BaseAgent {
             this.callingLLM(inputList, tokenCount);
         }
 
-        //5. 返回最终的输出结果
+        //5. 返回最终的输出结果（兜底保证非 null：超步数后的强制 done 也可能失败或不产出有效文本）
+        if (StrUtil.isBlank(this.finalResult)) {
+            return StrUtil.format("[{}]:任务未能正常完成（达到最大步数限制或模型未返回有效结果），请查看服务端日志", this.name());
+        }
         return this.finalResult;
     }
 
@@ -188,25 +191,40 @@ public abstract class ReActBaseAgent extends BaseAgent {
         //2. 创建prompt对象（携带完整历史消息与选项）
         var prompt = new Prompt(inputList, chatOptions);
 
-        //3. 调用AI大模型
-        ChatResponse chatResponse;
-        try {
-            if (this.modelConfig.isStream()) {
-                // 流式执行：收集所有分片后取第一个完整响应（因为工具调用需要完整参数）
-                chatResponse = this.chatModel()
-                        .stream(prompt)
-                        .collectList()
-                        .block()
-                        .stream()
-                        .findFirst()
-                        .orElseThrow();
-            } else {
-                // 非流式执行
-                chatResponse = this.chatModel().call(prompt);
+        //3. 调用AI大模型（最多尝试3次，指数退避1s/2s/4s；耗尽后抛出，由上层兜底为结构化错误）
+        ChatResponse chatResponse = null;
+        RuntimeException lastError = null;
+        for (int attempt = 1; attempt <= 3 && chatResponse == null; attempt++) {
+            try {
+                if (this.modelConfig.isStream()) {
+                    // 流式执行：收集所有分片后取第一个完整响应（因为工具调用需要完整参数）
+                    chatResponse = this.chatModel()
+                            .stream(prompt)
+                            .collectList()
+                            .block()
+                            .stream()
+                            .findFirst()
+                            .orElseThrow();
+                } else {
+                    // 非流式执行
+                    chatResponse = this.chatModel().call(prompt);
+                }
+            } catch (Exception e) {
+                lastError = new RuntimeException(e);
+                log.warn("调用AI大模型第{}次失败", attempt, e);
+                if (attempt < 3) {
+                    try {
+                        Thread.sleep(1000L * (1 << (attempt - 1)));
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw lastError;
+                    }
+                }
             }
-        } catch (Exception e) {
-            log.error("调用AI大模型时出错！", e);
-            throw new RuntimeException(e);
+        }
+        if (chatResponse == null) {
+            log.error("调用AI大模型时出错，重试耗尽！", lastError);
+            throw lastError;
         }
 
         //4. 解析大模型返回的结果
@@ -284,9 +302,18 @@ public abstract class ReActBaseAgent extends BaseAgent {
             processedActionList.add(action);
             // 每个 action 形如 {动作名: 参数}，取第一个 key 作为动作名
             String actName = CollUtil.getFirst(action.keySet());
+            // 未知动作显式反馈给模型而非 NPE，交由下一轮根据观察自行纠正
+            var actionFunction = this.actionRegistry.get(actName);
+            if (actionFunction == null) {
+                log.warn("未知动作:{}", actName);
+                resultBuilder.append(action).append("->")
+                        .append("Error:未知动作 ").append(actName)
+                        .append("，可用动作列表:").append(this.actionRegistry.keySet()).append('\n');
+                break;
+            }
             try {
-                // 从注册表取得对应动作函数并执行，参数转为 Map 传入
-                var actionResult = this.actionRegistry.get(actName).apply(BeanUtil.beanToMap(action.get(actName)));
+                // 执行已取得的动作函数，参数转为 Map 传入
+                var actionResult = actionFunction.apply(BeanUtil.beanToMap(action.get(actName)));
                 resultBuilder.append(action).append("->").append(actionResult).append('\n');
             } catch (Exception e) {
                 log.error("error in running action:{}", action, e);

@@ -44,6 +44,9 @@ import java.util.function.Function;
 @Slf4j
 public class ReActPlanningAgent extends ReActBaseAgent {
 
+    // 单个子任务允许的最大步数上限（与规划系统提示词约定一致，钳制模型给出的异常取值）
+    private static final int MAX_SUBTASK_STEP = 16;
+
     // 规划智能体使用专用的计划模型（区别于主模型）
     @Resource(name = ModelConfig.PLAN_AGENT)
     private ChatModel chatModel;
@@ -98,6 +101,10 @@ public class ReActPlanningAgent extends ReActBaseAgent {
         this.subTaskChain.stream()
                 .reduce((x, y) -> y)
                 .ifPresent(last -> {
+                    // 防重复：已执行过的节点直接复用结果，不再派发
+                    if (last.isExecuted()) {
+                        return;
+                    }
                     // 获取当前任务
                     String originalTask = last.getSubTask();
                     // 将原任务与目标任务合并
@@ -106,6 +113,9 @@ public class ReActPlanningAgent extends ReActBaseAgent {
                     // 查找对应的智能体，修改最大步数为当前任务的最大步数
                     Function<MessageSession, Agent> agentFunction = AgentFactory.getAgent(AgentTypeEnum.agentNameOf(last.getAgent()));
                     if (ObjectUtil.isEmpty(agentFunction)) {
+                        // 兜底：标记失败而非静默跳过，避免同一节点每轮空转重试
+                        last.setResult(StrUtil.format("错误:未找到智能体[{}]", last.getAgent()));
+                        last.setExecuted(true);
                         return;
                     }
                     var agent = agentFunction.apply(super.messageSession);
@@ -114,6 +124,8 @@ public class ReActPlanningAgent extends ReActBaseAgent {
                         base.resetReActConfig(c -> c.setMaxStep(last.getMaxStep()));
                     }
 
+                    // 先标记再执行，杜绝重复派发（BaseAgent.solveTask 内部已兜底不会抛出异常）
+                    last.setExecuted(true);
                     // 调用智能体，获取结果
                     String result = agent.solveTask(subTaskWithCtx);
                     if (agent instanceof ReActBaseAgent base) {
@@ -186,6 +198,15 @@ public class ReActPlanningAgent extends ReActBaseAgent {
     public String generateNext(@ToolParam(description = "agent名称") String agent,
                                @ToolParam(description = "子任务内容") String subTask,
                                @ToolParam(description = "完成任务的最大步数") int maxStep) {
+        // 校验：只允许 agentInfo 中登记的专项智能体；未知名称返回纠正文本，由模型下一轮自纠
+        // （若不校验，未知名称会一路漏到派发时，AgentFactory.getAgent 抛异常炸穿整个任务）
+        if (!agentInfo.containsKey(agent)) {
+            log.warn("generateNext 收到未知智能体名称:{}", agent);
+            return StrUtil.format("未知的智能体名称:{}，请从以下列表中选择:{}", agent, agentInfo.keySet());
+        }
+        // 步数钳制到 [1, MAX_SUBTASK_STEP]，避免模型给出 0 或超大取值
+        int safeMaxStep = Math.max(1, Math.min(maxStep, MAX_SUBTASK_STEP));
+
         var res = subTaskChain.stream()
                 .reduce((x, y) -> y) // 获取最后一个元素
                 .map(p -> { // 对最后一个任务进行描述，生成了新的子任务
@@ -199,7 +220,7 @@ public class ReActPlanningAgent extends ReActBaseAgent {
         SubTaskNode subTaskNode = SubTaskNode.builder()
                 .agent(agent)
                 .subTask(subTask)
-                .maxStep(maxStep)
+                .maxStep(safeMaxStep)
                 .build();
         // 将子任务加入到任务链中
         this.subTaskChain.add(subTaskNode);
@@ -256,6 +277,8 @@ public class ReActPlanningAgent extends ReActBaseAgent {
         private int maxStep;
         private String result;
         private int resultStep = -1;
+        // 是否已派发执行过：防止模型某轮输出解析失败未追加新节点时，同一节点被原样重跑
+        private boolean executed = false;
 
         public String strInStatus() {
             return StrUtil.format("[{},Task:{},Result:{},resultStep:{}]",

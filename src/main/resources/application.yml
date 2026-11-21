@@ -5,16 +5,16 @@ spring:
     name: my-manus
 
 agent-model:
-  base-url: https://ark.cn-beijing.volces.com/api/
-  api-key: ${VOLCES_API_KEY}
-  model-name: deepseek-v3-250324
-  completions-path: /v3/chat/completions
+  base-url: https://dashscope.aliyuncs.com/compatible-mode/
+  api-key: sk-40f0f5b2d50d4c98a7418978117d0490 # 阿里百炼 DashScope API Key（明文提交有泄露风险，建议改为 ${DASHSCOPE_API_KEY} 环境变量）
+  model-name: glm-5.3
+  completions-path: /v1/chat/completions
   stream: false
 plan-model:
-  base-url: https://ark.cn-beijing.volces.com/api/
-  api-key: ${VOLCES_API_KEY}
-  model-name: deepseek-r1-250120
-  completions-path: /v3/chat/completions
+  base-url: https://dashscope.aliyuncs.com/compatible-mode/
+  api-key: sk-40f0f5b2d50d4c98a7418978117d0490
+  model-name: glm-5.3
+  completions-path: /v1/chat/completions
 
 file:
   base: F:\\tmp\\my-manus\\

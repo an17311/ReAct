@@ -43,6 +43,8 @@ export default {
     methods: {
         // 发送用户消息：本地追加展示 + 通过 STOMP 发布到服务端 /app/enhanced-dialog
         sendMessage() {
+            // 任务执行期间禁止重复提交（输入框回车不经过按钮的 disabled 属性，需在此守卫）
+            if (this.disableInput) return;
             if (this.newMessage.trim()) {
                 // 1. 构造用户消息并立即渲染到界面
                 var msg = { type: 'user', text: this.newMessage };

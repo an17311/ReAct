@@ -28,5 +28,21 @@ public class DialogMessageDTO {
     private String fileUrl;
     // 在线预览地址（在新窗口打开生成的内容）
     private String openUrl;
+    // 服务端状态提示（用于控制前端输入框可用性，前端 Dialog.vue 依据 meta.serverStatusHint 切换输入状态）
+    private Meta meta;
+
+    /**
+     * 服务端状态提示载体。
+     */
+    @Data
+    @Builder
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class Meta {
+
+        // 0：恢复输入；1：禁用输入
+        private Integer serverStatusHint;
+
+    }
 
 }
