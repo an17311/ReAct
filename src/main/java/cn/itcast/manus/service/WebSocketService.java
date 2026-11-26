@@ -13,4 +13,11 @@ public interface WebSocketService {
      */
     void enhancedDialog(DialogMessageDTO message, SimpMessageHeaderAccessor headerAccessor);
 
+    /**
+     * 取消当前会话正在执行的任务
+     *
+     * @param headerAccessor 消息头（用于获取会话 id）
+     */
+    void cancelDialog(SimpMessageHeaderAccessor headerAccessor);
+
 }

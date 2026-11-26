@@ -3,6 +3,7 @@
 下面的信息是一次性的 - 如果你需要记录任何内容请将其保存在memory字段中
 # 当前子任务链
 {subTaskChain}
+（链中每个节点含status字段：SUCCESS表示该子任务执行成功，FAILED表示执行失败需结合Result分析原因，PENDING表示待执行）
 # 上个子任务执行结果
 {latestResult}
 # 步骤信息

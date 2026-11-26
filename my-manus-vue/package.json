@@ -1,5 +1,5 @@
 {
-  "name": "vue-browser-use",
+  "name": "my-manus-vue",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -9,13 +9,18 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@element-plus/icons-vue": "^2.3.2",
     "@stomp/stompjs": "^7.0.0",
+    "element-plus": "^2.14.8",
+    "highlight.js": "^11.12.0",
+    "markdown-it": "^15.0.3",
     "sockjs-client": "^1.6.1",
     "vue": "^3.5.13"
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^5.2.3",
     "vite": "^6.2.4",
-    "vite-plugin-vue-devtools": "^7.7.2"
+    "vite-plugin-vue-devtools": "^7.7.2",
+    "ws": "^8.23.0"
   }
 }

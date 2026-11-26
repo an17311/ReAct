@@ -30,4 +30,39 @@ public interface MessageSession {
      * 发送消息
      */
     void sendMessage(DialogMessageDTO messageDTO);
+
+    /**
+     * 尝试标记任务开始（单飞控制）：同一会话同一时间仅允许一个任务执行。
+     *
+     * @return true 标记成功；false 表示已有任务在执行，本次应拒绝
+     */
+    default boolean tryMarkRunning() {
+        return true;
+    }
+
+    /**
+     * 标记任务结束（与 {@link #tryMarkRunning} 配对使用）
+     */
+    default void markFinished() {
+    }
+
+    /**
+     * 请求取消当前会话正在执行的任务
+     */
+    default void requestCancel() {
+    }
+
+    /**
+     * 任务是否已被请求取消
+     */
+    default boolean isCancelled() {
+        return false;
+    }
+
+    /**
+     * 客户端连接是否存活（已断开或连续推送失败视为失活，引擎据此终止任务避免空烧资源）
+     */
+    default boolean isAlive() {
+        return true;
+    }
 }

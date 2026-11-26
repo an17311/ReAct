@@ -1,6 +1,12 @@
-import './assets/main.css'
-
 import { createApp } from 'vue'
-import Dialog from './Dialog.vue'
+import ElementPlus from 'element-plus'
+import zhCn from 'element-plus/es/locale/lang/zh-cn'
+import 'element-plus/dist/index.css'
+import 'element-plus/theme-chalk/dark/css-vars.css'
+import 'highlight.js/styles/atom-one-dark.css'
+import './styles/theme.css'
+import App from './App.vue'
 
-createApp(Dialog).mount('#app')
+const app = createApp(App)
+app.use(ElementPlus, { locale: zhCn })
+app.mount('#app')

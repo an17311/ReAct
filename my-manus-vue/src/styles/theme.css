@@ -1,0 +1,185 @@
+/* ============================================================
+   全局设计变量与基础样式（明/暗双主题）
+   组件样式统一引用这里的变量，暗色模式通过 html.dark 切换。
+   ============================================================ */
+
+:root {
+    /* 主色 */
+    --primary: #6366f1;
+    --primary-hover: #4f46e5;
+    --primary-light: rgba(99, 102, 241, 0.12);
+
+    /* 背景 */
+    --bg-page: #f5f6f8;
+    --bg-sidebar: #ffffff;
+    --bg-card: #ffffff;
+    --bg-chat-user: linear-gradient(135deg, #6366f1, #8b5cf6);
+
+    /* 文本 */
+    --text-primary: #1f2329;
+    --text-secondary: #6b7280;
+    --text-tertiary: #9ca3af;
+    --text-on-primary: #ffffff;
+
+    /* 边框与阴影 */
+    --border-color: #e5e7eb;
+    --shadow-card: 0 1px 3px rgba(0, 0, 0, 0.05);
+    --shadow-float: 0 8px 24px rgba(0, 0, 0, 0.12);
+
+    /* 圆角 */
+    --radius-sm: 8px;
+    --radius-md: 12px;
+    --radius-lg: 16px;
+    --radius-full: 999px;
+
+    /* 状态色 */
+    --success: #10b981;
+    --warning: #f59e0b;
+    --danger: #ef4444;
+}
+
+html.dark {
+    --primary: #818cf8;
+    --primary-hover: #6366f1;
+    --primary-light: rgba(129, 140, 248, 0.16);
+
+    --bg-page: #111318;
+    --bg-sidebar: #171922;
+    --bg-card: #1c1f28;
+    --bg-chat-user: linear-gradient(135deg, #6366f1, #8b5cf6);
+
+    --text-primary: #e5e7eb;
+    --text-secondary: #9ca3af;
+    --text-tertiary: #6b7280;
+    --text-on-primary: #ffffff;
+
+    --border-color: #2d313d;
+    --shadow-card: 0 1px 3px rgba(0, 0, 0, 0.4);
+    --shadow-float: 0 8px 24px rgba(0, 0, 0, 0.5);
+
+    --success: #34d399;
+    --warning: #fbbf24;
+    --danger: #f87171;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+html,
+body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+        'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+    color: var(--text-primary);
+    background: var(--bg-page);
+    -webkit-font-smoothing: antialiased;
+}
+
+#app {
+    height: 100%;
+}
+
+/* 滚动条弱化 */
+::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--border-color);
+    border-radius: 3px;
+}
+
+::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+/* markdown 内容区排版（结果气泡/预览共用） */
+.md-body {
+    line-height: 1.75;
+    word-break: break-word;
+    font-size: 14.5px;
+}
+
+.md-body p {
+    margin: 0.4em 0;
+}
+
+.md-body h1,
+.md-body h2,
+.md-body h3,
+.md-body h4 {
+    margin: 0.8em 0 0.4em;
+    line-height: 1.4;
+}
+
+.md-body ul,
+.md-body ol {
+    margin: 0.4em 0;
+    padding-left: 1.4em;
+}
+
+.md-body table {
+    border-collapse: collapse;
+    margin: 0.8em 0;
+    width: 100%;
+    overflow-x: auto;
+    display: block;
+}
+
+.md-body th,
+.md-body td {
+    border: 1px solid var(--border-color);
+    padding: 6px 12px;
+    text-align: left;
+    font-size: 13.5px;
+}
+
+.md-body th {
+    background: var(--primary-light);
+    font-weight: 600;
+}
+
+.md-body code {
+    background: var(--primary-light);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 13px;
+    font-family: 'JetBrains Mono', Consolas, monospace;
+}
+
+.md-body pre {
+    background: #1e1e2e;
+    color: #cdd6f4;
+    padding: 14px 16px;
+    border-radius: var(--radius-sm);
+    overflow-x: auto;
+    margin: 0.8em 0;
+}
+
+.md-body pre code {
+    background: transparent;
+    padding: 0;
+    color: inherit;
+}
+
+.md-body blockquote {
+    margin: 0.6em 0;
+    padding: 4px 12px;
+    border-left: 3px solid var(--primary);
+    background: var(--primary-light);
+    border-radius: 0 6px 6px 0;
+    color: var(--text-secondary);
+}
+
+.md-body a {
+    color: var(--primary);
+    text-decoration: none;
+}
+
+.md-body a:hover {
+    text-decoration: underline;
+}

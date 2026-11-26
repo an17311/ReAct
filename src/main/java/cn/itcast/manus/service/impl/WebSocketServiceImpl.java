@@ -63,12 +63,16 @@ public class WebSocketServiceImpl implements WebSocketService {
         // 通过会话id，获取到会话对象
         var messageSession = this.sessionManagement.sessionDialog(sessionId);
 
+        // 会话级单飞：同一会话已有任务在执行时拒绝新任务（消息不入队，避免遗留脏消息被下一个任务读到）
+        if (!messageSession.tryMarkRunning()) {
+            log.warn("会话{}已有任务在执行，拒绝新任务", sessionId);
+            messageSession.sendMessage("[系统]当前已有任务在执行中，请等待完成或取消后再试");
+            return;
+        }
+
         // 接收消息数据
         messageSession.receiveMessages(message);
-        // log.info("receive message: {}", messageSession.readMessage());
 
-        // 给客户端发送消息
-        // messageSession.sendMessage("消息已收到！");
         // 从工厂获取“任务规划智能体”的构造函数，并绑定当前会话创建一个智能体实例
         var agent = AgentFactory.getAgent(AgentTypeEnum.RE_ACT_PLANNING_AGENT).apply(messageSession);
 
@@ -76,6 +80,7 @@ public class WebSocketServiceImpl implements WebSocketService {
         messageSession.sendMessage(DialogMessageDTO.builder()
                 .text("任务开始执行，请稍候...")
                 .meta(DialogMessageDTO.Meta.builder().serverStatusHint(1).build())
+                .eventType(DialogMessageDTO.EVENT_LIFECYCLE_START)
                 .build());
 
         Runnable src = () -> {
@@ -85,18 +90,36 @@ public class WebSocketServiceImpl implements WebSocketService {
                 // 通过规划agent进行执行（内部会拆解任务并调度各专项智能体）
                 var finalResult = agent.solveTask(rawInput);
                 log.info("complete with final result:{}", finalResult);
-                // 将最终结果回推给客户端（结果为空时给占位文本，避免前端因无文本而不渲染）
-                messageSession.sendMessage(StrUtil.blankToDefault(finalResult, "[系统]任务已结束，但未获取到有效结果"));
+                // 将最终结果回推给客户端（结果为空时给占位文本，避免前端因无文本而不渲染）。
+                // 注意：done 的 text 常以 [Agent名] 前缀完整携带最后一个子任务结果，需显式标记为 result 事件，
+                // 避免被 WSSession 文本分类器误判为进度；[系统] 开头的中止结果（取消等）仍交给分类器归类
+                var finalResultText = StrUtil.blankToDefault(finalResult, "[系统]任务已结束，但未获取到有效结果");
+                if (StrUtil.startWith(finalResultText, "[系统]")) {
+                    messageSession.sendMessage(finalResultText);
+                } else {
+                    messageSession.sendMessage(DialogMessageDTO.builder()
+                            .text(finalResultText)
+                            .eventType(DialogMessageDTO.EVENT_RESULT)
+                            .build());
+                }
             } catch (Exception e) {
                 // 异常兜底：将错误信息通知用户，避免前端无感知地一直等待
                 log.error("任务执行异常", e);
-                messageSession.sendMessage("[系统]任务执行异常：" + e.getMessage());
+                messageSession.sendMessage(DialogMessageDTO.builder()
+                        .text("[系统]任务执行异常：" + e.getMessage())
+                        .eventType(DialogMessageDTO.EVENT_SYSTEM_ERROR)
+                        .build());
             } finally {
                 // 统一结束信号：无论成功或异常都会发送，保证前端收到终止标志并恢复输入框
-                messageSession.sendMessage("任务流程结束");
+                messageSession.sendMessage(DialogMessageDTO.builder()
+                        .text("任务流程结束")
+                        .eventType(DialogMessageDTO.EVENT_LIFECYCLE_END)
+                        .build());
                 messageSession.sendMessage(DialogMessageDTO.builder()
                         .meta(DialogMessageDTO.Meta.builder().serverStatusHint(0).build())
                         .build());
+                // 释放单飞标记，允许该会话接收下一个任务
+                messageSession.markFinished();
                 // 无论成功或异常，都清理会话，避免会话对象泄漏
                 sessionManagement.clean(sessionId);
             }
@@ -112,9 +135,33 @@ public class WebSocketServiceImpl implements WebSocketService {
             messageSession.sendMessage(DialogMessageDTO.builder()
                     .meta(DialogMessageDTO.Meta.builder().serverStatusHint(0).build())
                     .build());
+            messageSession.markFinished();
             sessionManagement.clean(sessionId);
         }
 
+    }
+
+    /**
+     * 取消当前会话正在执行的任务：标记取消后，引擎在最近的检查点（每轮循环/每个动作前）安全终止。
+     *
+     * @param headerAccessor 消息头（用于获取会话 id）
+     */
+    @Override
+    public void cancelDialog(SimpMessageHeaderAccessor headerAccessor) {
+        var sessionId = headerAccessor.getSessionId();
+        var messageSessionOpt = this.sessionManagement.findSession(sessionId);
+        if (messageSessionOpt.isEmpty()) {
+            log.info("会话{}无活动任务，忽略取消请求", sessionId);
+            return;
+        }
+        var messageSession = messageSessionOpt.get();
+        if (messageSession.isCancelled()) {
+            // 已请求过取消，幂等返回
+            return;
+        }
+        log.info("会话{}请求取消任务", sessionId);
+        messageSession.requestCancel();
+        messageSession.sendMessage("[系统]已收到取消请求，任务将在当前步骤结束后终止...");
     }
 
 }

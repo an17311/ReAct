@@ -32,8 +32,16 @@ import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.tool.ToolCallbackProvider;
 import org.springframework.ai.tool.definition.DefaultToolDefinition;
 import org.springframework.ai.tool.definition.ToolDefinition;
+import org.springframework.ai.tokenizer.JTokkitTokenCountEstimator;
+import org.springframework.ai.tokenizer.TokenCountEstimator;
 
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -73,6 +81,21 @@ public abstract class ReActBaseAgent extends BaseAgent {
     private ToolDefinition toolDefinition;
     // 定义动作映射，key为动作名称，value为动作执行函数（key：参数，value：执行返回值）
     private final Map<String, Function<Map<String, Object>, String>> actionRegistry = new HashMap<>();
+
+    // 动作执行专用线程池（守护线程），用于动作超时控制
+    private static final ExecutorService ACTION_EXECUTOR = Executors.newCachedThreadPool(r -> {
+        var t = new Thread(r, "react-action-worker");
+        t.setDaemon(true);
+        return t;
+    });
+    // token 估算器，用于上下文预算控制
+    private final TokenCountEstimator tokenEstimator = new JTokkitTokenCountEstimator();
+    // 初始输入消息边界（System/任务/示例），上下文压缩时始终保留
+    private int initInputSize = 0;
+    // 连续解析失败计数
+    private int parseFailCount = 0;
+    // 最近一次动作观察结果（解析失败达到上限强制终止时，用于兜底说明）
+    private String lastObservation = "";
 
     /**
      * 使用默认的 ReAct 工具 Schema 构造智能体。
@@ -141,12 +164,21 @@ public abstract class ReActBaseAgent extends BaseAgent {
         //2. 定义输入消息列表（由子类填入 System/User 提示词及示例）
         var inputList = new LinkedList<Message>();
         this.addInitInput(inputList, task);
+        // 记录初始输入边界，上下文压缩时始终保留这一段
+        this.initInputSize = inputList.size();
+        this.parseFailCount = 0;
 
         //3. 循环执行，结束条件：任务终止（done动作） 或 任务的执行步骤已经超过最大的步骤
         var tokenCount = new AtomicLong(0L);
         // 初始化当前步骤
         this.currentStep = 1;
         while (this.currentStep <= this.reActConfig.getMaxStep() && !this.agentStop) {
+            // 取消/客户端失活检查：命中则立即终止，避免对已离开的用户空烧 token
+            if (this.checkAborted()) {
+                break;
+            }
+            // 上下文超出 token 预算时，压缩早期历史
+            this.compressHistoryIfNeeded(inputList);
             // 将当前的Agent的状态加入到消息列表中（每步提供最新上下文）
             this.buildCurrentParse(inputList);
             // 调用大模型，并在其内部依次触发响应解析与动作执行
@@ -156,8 +188,8 @@ public abstract class ReActBaseAgent extends BaseAgent {
             this.currentStep++;
         }
 
-        //4. 检查步骤是否已经超过了最大步数，如果已经超过，就调用大模型来触发执行done动作
-        if (this.currentStep >= this.reActConfig.getMaxStep() && !this.agentStop) {
+        //4. 检查步骤是否已经超过了最大步数，如果已经超过（且未被取消/失活），就调用大模型来触发执行done动作
+        if (this.currentStep >= this.reActConfig.getMaxStep() && !this.agentStop && !this.isAborted()) {
             // 提示模型立即用 done 总结当前成果，避免因超步数而无结果
             String text = """
                     注意，你的执行已达到最大步数限制，请立即使用done操作返回截至到目前的工作成果，
@@ -258,20 +290,68 @@ public abstract class ReActBaseAgent extends BaseAgent {
                 log.warn("找到1个以上的工具执行请求列表:{}", assistantMessage.getToolCalls());
             }
             var tool = CollUtil.getFirst(assistantMessage.getToolCalls());
-            if (StrUtil.equalsIgnoreCase(tool.name(), AGENT_OUTPUT_METHOD)) {
+            if (!StrUtil.equalsIgnoreCase(tool.name(), AGENT_OUTPUT_METHOD)) {
+                log.warn("工具名称不符:{}", tool.name());
+                this.handleParseFailure(assistantMessage, inputList);
+                return;
+            }
+            try {
                 // 将工具参数 JSON 反序列化为 ReActInput，进入动作执行
                 ReActInput reActInput = JSONUtil.toBean(tool.arguments(), ReActInput.class);
                 this.agentOutput(reActInput, inputList, assistantMessage);
-            } else {
-                log.error("未知工具名称:{}", tool.name());
+            } catch (Exception e) {
+                // 参数 JSON 非法或状态字段缺失等：按解析失败处理，由下一轮修正重试
+                log.warn("AgentOutput 参数解析失败:{}", e.getMessage());
+                this.handleParseFailure(assistantMessage, inputList);
             }
             return;
         }
 
         // 情况 B：未触发工具调用，则从纯文本中查找第一个合法 JSON 作为兜底解析
-        JsonFinder.findFirstJson(text)
-                .map(json -> JSONUtil.toBean(json, ReActInput.class))
-                .ifPresent(reActInput -> this.agentOutput(reActInput, inputList, assistantMessage));
+        var reActInputOpt = JsonFinder.findFirstJson(text)
+                .map(json -> JSONUtil.toBean(json, ReActInput.class));
+        if (reActInputOpt.isPresent()) {
+            try {
+                this.agentOutput(reActInputOpt.get(), inputList, assistantMessage);
+            } catch (Exception e) {
+                log.warn("文本兜底解析的输出处理失败:{}", e.getMessage());
+                this.handleParseFailure(assistantMessage, inputList);
+            }
+            return;
+        }
+
+        // 情况 C：完全无法解析（无工具调用且文本中无合法 JSON）
+        this.handleParseFailure(assistantMessage, inputList);
+    }
+
+    /**
+     * 解析失败处理：重建历史（移除本轮状态消息、保留模型原始输出），追加修正提示由下一轮重试；
+     * 连续失败达到上限时强制终止任务，避免死循环空烧 token。
+     */
+    private void handleParseFailure(AssistantMessage assistantMessage, List<Message> inputList) {
+        this.parseFailCount++;
+        // 移除本轮由 buildCurrentParse 加入的状态消息，保持历史协议一致
+        inputList.remove(inputList.size() - 1);
+        // 保留模型原始输出，供模型看到自己上一轮的错误
+        inputList.add(assistantMessage);
+        if (assistantMessage.hasToolCalls()) {
+            // 因禁用了 SpringAI 自动执行，需手动补充工具响应消息，否则下一轮请求会因协议不完整被 API 拒绝
+            var toolCall = CollUtil.getFirst(assistantMessage.getToolCalls());
+            inputList.add(new ToolResponseMessage(
+                    List.of(new ToolResponseMessage.ToolResponse(toolCall.id(), toolCall.name(), "ignored: invalid tool call"))));
+        }
+
+        if (this.parseFailCount >= this.reActConfig.getParseFailRetryLimit()) {
+            // 达到修正重试上限：强制终止并返回已有成果说明
+            log.warn("连续{}次解析失败，强制终止任务", this.parseFailCount);
+            this.done(StrUtil.format("[系统]模型连续{}次未能按要求通过AgentOutput输出结构化结果，任务已终止。最近一次执行观察：{}",
+                    this.parseFailCount, StrUtil.truncateUtf8(this.lastObservation, 200)));
+            return;
+        }
+
+        inputList.add(new UserMessage("错误：你的上一次输出未能解析为有效的AgentOutput工具调用。"
+                + "你必须严格通过AgentOutput工具以JSON参数返回，current_state与action字段均不能省略，"
+                + "action中只能使用已定义的动作名称。请重新输出。"));
     }
 
     /**
@@ -282,6 +362,8 @@ public abstract class ReActBaseAgent extends BaseAgent {
      * @param assistantMessage 模型本次生成的助手消息
      */
     private void agentOutput(ReActInput reActInput, List<Message> inputList, AssistantMessage assistantMessage) {
+        // 本轮成功解析，清零连续解析失败计数
+        this.parseFailCount = 0;
         var status = reActInput.getStatus();
         // 打印 ReAct 的三个推理要素：目标评估 / 记忆 / 思考
         log.info("🏹 previous goal:{}", status.getEvaluationPreviousGoal());
@@ -299,6 +381,11 @@ public abstract class ReActBaseAgent extends BaseAgent {
         var resultBuilder = new StringBuilder();
         var processedActionList = new LinkedList<>();
         for (var action : srcActionList) {
+            // 取消/客户端失活检查：命中则中止剩余动作，观察结果中告知模型
+            if (this.isAborted()) {
+                resultBuilder.append("NOTICE:任务已取消或客户端已断开，中止剩余动作\n");
+                break;
+            }
             processedActionList.add(action);
             // 每个 action 形如 {动作名: 参数}，取第一个 key 作为动作名
             String actName = CollUtil.getFirst(action.keySet());
@@ -312,13 +399,13 @@ public abstract class ReActBaseAgent extends BaseAgent {
                 break;
             }
             try {
-                // 执行已取得的动作函数，参数转为 Map 传入
-                var actionResult = actionFunction.apply(BeanUtil.beanToMap(action.get(actName)));
+                // 执行动作（带超时控制），参数转为 Map 传入
+                var actionResult = this.executeActionWithTimeout(actionFunction, action.get(actName));
                 resultBuilder.append(action).append("->").append(actionResult).append('\n');
             } catch (Exception e) {
                 log.error("error in running action:{}", action, e);
-                // break loop（动作异常时记录错误并中断，交由下一轮模型重新决策）
-                resultBuilder.append(action).append("->").append("Exception:").append(StrUtil.truncateUtf8(e.getMessage(), 32)).append('\n');
+                // break loop（动作异常时记录分类后的错误并中断，交由下一轮模型重新决策）
+                resultBuilder.append(action).append("->").append(this.describeActionError(e)).append('\n');
                 break;
             }
 
@@ -346,6 +433,8 @@ public abstract class ReActBaseAgent extends BaseAgent {
 
         // 2.得到结果（所有动作的观察汇总）
         String actionResult = resultBuilder.toString();
+        // 记录最近一次观察，供解析失败强制终止时的兜底说明使用
+        this.lastObservation = actionResult;
         log.info("📃 obs:{}", actionResult);
 
         // 3.按当前结果重建消息列表（历史部分）
@@ -362,6 +451,118 @@ public abstract class ReActBaseAgent extends BaseAgent {
         }
         // 将动作观察结果以 UserMessage 形式回写，供下一轮模型参考
         inputList.add(new UserMessage(String.format("思路'%s'的行动结果如下:\n%s", status.getThinking(), actionResult)));
+    }
+
+    /**
+     * 任务是否已应中止：用户请求取消，或客户端已失活（断连/连续推送失败）。
+     */
+    private boolean isAborted() {
+        return this.messageSession.isCancelled() || !this.messageSession.isAlive();
+    }
+
+    /**
+     * 中止检查：命中时通过 done 机制标记终止并生成结果说明。
+     *
+     * @return true 表示任务已中止，循环应立即退出
+     */
+    private boolean checkAborted() {
+        if (!this.isAborted()) {
+            return false;
+        }
+        var reason = this.messageSession.isCancelled() ? "任务已被取消" : "客户端已断开连接";
+        log.warn("ReAct 循环中止: {}", reason);
+        this.done(StrUtil.format("[系统]{}", reason));
+        return true;
+    }
+
+    /**
+     * 上下文预算控制：估算消息总 token，超出预算时从最早的历史轮次开始压缩，
+     * 始终保留初始输入（System/任务/示例）与最近的 {@code keepRecentMessages} 条消息。
+     */
+    private void compressHistoryIfNeeded(LinkedList<Message> inputList) {
+        if (this.estimateTokens(inputList) <= this.reActConfig.getMaxContextTokens()) {
+            return;
+        }
+        int keep = this.reActConfig.getKeepRecentMessages();
+        int removableEnd = inputList.size() - keep;
+        if (removableEnd <= this.initInputSize) {
+            log.warn("上下文超出token预算，但已无可压缩的历史消息");
+            return;
+        }
+        // 从最早的历史轮次开始删除（初始输入与最近消息保留），直到回到预算内或无可删除
+        while (inputList.size() - keep > this.initInputSize
+                && this.estimateTokens(inputList) > this.reActConfig.getMaxContextTokens()) {
+            inputList.remove(this.initInputSize);
+        }
+        // 在保留历史之前插入压缩说明，让模型知晓早期上下文已被移除
+        inputList.add(this.initInputSize, new UserMessage(
+                "[系统提示]较早的对话历史已因超出上下文预算被压缩，仅保留系统提示、初始任务与最近的执行记录；"
+                        + "如需保留关键信息，请在后续输出的memory字段中记录。"));
+        log.info("上下文历史已压缩，当前消息数:{}", inputList.size());
+    }
+
+    /**
+     * 估算消息列表的总 token 数（文本为空的消息按 0 计）。
+     */
+    private long estimateTokens(List<Message> messages) {
+        long total = 0;
+        for (Message message : messages) {
+            var text = message.getText();
+            if (StrUtil.isNotBlank(text)) {
+                total += this.tokenEstimator.estimate(text);
+            }
+        }
+        return total;
+    }
+
+    /**
+     * 带超时的动作执行：超时按 {@link ActionTimeoutException} 抛出，交由错误分类生成观察。
+     * <p>注意：超时仅放弃等待结果，若工具内部不可中断，其线程可能仍在后台运行直至自然结束。</p>
+     */
+    private String executeActionWithTimeout(Function<Map<String, Object>, String> actionFunction, Object params) {
+        var future = CompletableFuture.supplyAsync(() -> actionFunction.apply(BeanUtil.beanToMap(params)), ACTION_EXECUTOR);
+        try {
+            return future.get(this.reActConfig.getActionTimeoutSeconds(), TimeUnit.SECONDS);
+        } catch (TimeoutException te) {
+            future.cancel(true);
+            throw new ActionTimeoutException("action exceeded " + this.reActConfig.getActionTimeoutSeconds() + "s");
+        } catch (ExecutionException ee) {
+            var cause = ee.getCause();
+            if (cause instanceof RuntimeException re) {
+                throw re;
+            }
+            throw new RuntimeException(cause);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("action execution interrupted", ie);
+        }
+    }
+
+    /**
+     * 动作错误分类：将异常归类为模型可理解的观察文本（含类型提示与截断后的错误信息）。
+     */
+    private String describeActionError(Exception e) {
+        String type;
+        if (e instanceof ActionTimeoutException) {
+            type = "动作执行超时(超过" + this.reActConfig.getActionTimeoutSeconds() + "秒)，建议拆分动作参数、减小等待时长或改用其他方式";
+        } else if (e instanceof NullPointerException
+                || e instanceof IllegalArgumentException
+                || e instanceof ClassCastException) {
+            type = "动作参数错误，请检查参数名称与取值格式";
+        } else {
+            type = "动作执行异常，可稍后重试或改用其他方式";
+        }
+        return StrUtil.format("Error:{} - {}:{}", type, e.getClass().getSimpleName(),
+                StrUtil.truncateUtf8(StrUtil.nullToEmpty(e.getMessage()), 200));
+    }
+
+    /**
+     * 动作执行超时异常，用于错误分类
+     */
+    private static class ActionTimeoutException extends RuntimeException {
+        public ActionTimeoutException(String message) {
+            super(message);
+        }
     }
 
     /**

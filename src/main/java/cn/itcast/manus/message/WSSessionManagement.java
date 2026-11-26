@@ -2,10 +2,13 @@ package cn.itcast.manus.message;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.event.EventListener;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.stereotype.Component;
+import org.springframework.web.socket.messaging.SessionDisconnectEvent;
 
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -33,12 +36,40 @@ public class WSSessionManagement {
     }
 
     /**
+     * 按会话 id 查找已存在的会话对象（不创建）。
+     *
+     * @param sessionId 会话 id
+     * @return 会话对象；不存在时返回空
+     */
+    public Optional<MessageSession> findSession(String sessionId) {
+        return Optional.ofNullable(this.sessionMap.get(sessionId));
+    }
+
+    /**
      * 清理会话对象
      *
      * @param sessionId 会话ID
      */
     public void clean(String sessionId) {
         this.sessionMap.remove(sessionId);
+    }
+
+    /**
+     * 监听 STOMP 断连事件：标记该会话客户端已断开并自动请求取消，
+     * 使引擎在最近的检查点终止任务，避免对已离开的用户空烧 token。
+     * <p>会话对象不从映射中移除，仍由任务结束时的 {@link #clean} 统一清理。</p>
+     */
+    @EventListener
+    public void onSessionDisconnect(SessionDisconnectEvent event) {
+        var sessionId = event.getSessionId();
+        this.findSession(sessionId).ifPresent(session -> {
+            if (session instanceof WSSession wsSession) {
+                wsSession.markDisconnected();
+            } else {
+                session.requestCancel();
+            }
+            log.info("WebSocket 会话断开，已标记取消: {}", sessionId);
+        });
     }
 
 }

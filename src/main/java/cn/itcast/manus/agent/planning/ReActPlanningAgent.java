@@ -10,6 +10,7 @@ import cn.itcast.manus.agent.ReActBaseAgent;
 import cn.itcast.manus.agent.prompt.PromptManagement;
 import cn.itcast.manus.config.ModelConfig;
 import cn.itcast.manus.constants.Constant;
+import cn.itcast.manus.dto.DialogMessageDTO;
 import cn.itcast.manus.enums.AgentTypeEnum;
 import cn.itcast.manus.message.MessageSession;
 import jakarta.annotation.PostConstruct;
@@ -115,7 +116,9 @@ public class ReActPlanningAgent extends ReActBaseAgent {
                     if (ObjectUtil.isEmpty(agentFunction)) {
                         // 兜底：标记失败而非静默跳过，避免同一节点每轮空转重试
                         last.setResult(StrUtil.format("错误:未找到智能体[{}]", last.getAgent()));
+                        last.setStatus("FAILED");
                         last.setExecuted(true);
+                        this.pushPlanUpdate();
                         return;
                     }
                     var agent = agentFunction.apply(super.messageSession);
@@ -124,17 +127,23 @@ public class ReActPlanningAgent extends ReActBaseAgent {
                         base.resetReActConfig(c -> c.setMaxStep(last.getMaxStep()));
                     }
 
-                    // 先标记再执行，杜绝重复派发（BaseAgent.solveTask 内部已兜底不会抛出异常）
+                    // 标记为执行中并推送计划面板事件，让前端实时看到当前正在执行的子任务
                     last.setExecuted(true);
+                    last.setStatus("RUNNING");
+                    this.pushPlanUpdate();
+
                     // 调用智能体，获取结果
                     String result = agent.solveTask(subTaskWithCtx);
                     if (agent instanceof ReActBaseAgent base) {
                         // 设置结果的步数，就是当前的任务的步数
                         last.setResultStep(base.getCurrentStep());
                     }
-                    // 将结果保存到中间结果中
+                    // 将结果保存到中间结果中，并标记执行状态（供规划模型感知失败并重规划）
                     subTaskMidResult.put(originalTask, result);
                     last.setResult(result);
+                    last.setStatus(this.classifyResult(result));
+                    // 推送子任务完成/失败后的计划面板事件
+                    this.pushPlanUpdate();
                 });
 
         // 将子任务链中的结果以字符串拼接，拼接格式为：子任务1->子任务2->子任务3
@@ -176,6 +185,21 @@ public class ReActPlanningAgent extends ReActBaseAgent {
     }
 
     /**
+     * 子任务结果分类：识别 BaseAgent 异常兜底格式（[AgentName]:错误信息）、
+     * 派发失败标记（"错误:"开头）与引擎中止结果（"[系统]"开头），失败结果显式标记为 FAILED，
+     * 供规划模型感知失败并调整后续规划。
+     */
+    private String classifyResult(String result) {
+        if (StrUtil.isBlank(result)) {
+            return "FAILED";
+        }
+        if (result.startsWith("错误:") || result.startsWith("[系统]") || result.matches("^\\[\\w+\\]:.*")) {
+            return "FAILED";
+        }
+        return "SUCCESS";
+    }
+
+    /**
      * 规划智能体每轮只执行一个 action，后面的 action 不再执行（需先观察子智能体结果）。
      *
      * @return 始终返回 true
@@ -207,6 +231,19 @@ public class ReActPlanningAgent extends ReActBaseAgent {
         // 步数钳制到 [1, MAX_SUBTASK_STEP]，避免模型给出 0 或超大取值
         int safeMaxStep = Math.max(1, Math.min(maxStep, MAX_SUBTASK_STEP));
 
+        // 同一子任务（同Agent+同内容）失败自动重试上限为1次：
+        // 链上已存在2个相同失败节点（首次失败+重试失败）时，禁止再次生成完全相同的子任务
+        long identicalFailedCount = subTaskChain.stream()
+                .filter(n -> "FAILED".equals(n.getStatus()))
+                .filter(n -> n.getAgent().equals(agent) && n.getSubTask().equals(subTask))
+                .count();
+        if (identicalFailedCount >= 2) {
+            log.warn("generateNext 子任务重试超限: agent={}, subTask={}", agent, subTask);
+            return StrUtil.format("该子任务以完全相同的内容已执行并失败{}次，不允许继续重试。"
+                            + "请调整子任务内容、换用其他Agent、拆分为更细粒度的子任务，或放弃该分支并在memory中说明原因。",
+                    identicalFailedCount);
+        }
+
         var res = subTaskChain.stream()
                 .reduce((x, y) -> y) // 获取最后一个元素
                 .map(p -> { // 对最后一个任务进行描述，生成了新的子任务
@@ -224,7 +261,27 @@ public class ReActPlanningAgent extends ReActBaseAgent {
                 .build();
         // 将子任务加入到任务链中
         this.subTaskChain.add(subTaskNode);
+        // 推送计划面板事件：前端实时展示子任务链（新节点为待执行状态）
+        this.pushPlanUpdate();
         return res;
+    }
+
+    /**
+     * 向前端推送计划面板事件：携带当前子任务链快照（仅 agent/subTask/status 三个字段，避免序列化大对象），
+     * 前端据此渲染 Manus 风格的任务计划列表。
+     */
+    private void pushPlanUpdate() {
+        var plan = this.subTaskChain.stream()
+                .map(n -> DialogMessageDTO.PlanStep.builder()
+                        .agent(n.getAgent())
+                        .subTask(n.getSubTask())
+                        .status(n.getStatus())
+                        .build())
+                .toList();
+        super.messageSession.sendMessage(DialogMessageDTO.builder()
+                .eventType(DialogMessageDTO.EVENT_PLAN_UPDATE)
+                .plan(plan)
+                .build());
     }
 
     @Override
@@ -279,11 +336,15 @@ public class ReActPlanningAgent extends ReActBaseAgent {
         private int resultStep = -1;
         // 是否已派发执行过：防止模型某轮输出解析失败未追加新节点时，同一节点被原样重跑
         private boolean executed = false;
+        // 执行状态：PENDING 待执行 / SUCCESS 成功 / FAILED 失败（展示给规划模型用于重规划）
+        @Builder.Default
+        private String status = "PENDING";
 
         public String strInStatus() {
-            return StrUtil.format("[{},Task:{},Result:{},resultStep:{}]",
+            return StrUtil.format("[{},Task:{},status:{},Result:{},resultStep:{}]",
                     agent,
                     subTask,
+                    status,
                     StrUtil.truncateUtf8(result, 20),
                     resultStep);
         }

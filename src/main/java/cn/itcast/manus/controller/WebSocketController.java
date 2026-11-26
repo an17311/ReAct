@@ -34,4 +34,19 @@ public class WebSocketController {
         this.webSocketService.enhancedDialog(messageDTO, headerAccessor);
     }
 
+    /**
+     * 处理前端发布的取消请求。
+     * <p>{@code @MessageMapping("/cancel")} 将目的地 {@code /app/cancel} 的消息路由到此方法，
+     * 由服务层标记取消后，引擎在最近的检查点安全终止当前任务。</p>
+     *
+     * @param headerAccessor 消息头访问器，用于获取当前 WebSocket 会话 id
+     */
+    @MessageMapping("/cancel")
+    public void cancelDialog(SimpMessageHeaderAccessor headerAccessor) {
+        log.info("cancel-dialog received");
+
+        //业务处理
+        this.webSocketService.cancelDialog(headerAccessor);
+    }
+
 }
